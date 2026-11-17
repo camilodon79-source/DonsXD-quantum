@@ -1,4 +1,4 @@
-import asyncio, os, time, secrets, json
+import asyncio, os, time, secrets, json, re
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
@@ -19,21 +19,37 @@ def log(m):
 def auth(pw):
     if PASSWORD and not secrets.compare_digest(pw or "", PASSWORD): raise HTTPException(401, "Mot de passe incorrect")
 
-def parse_ssid(s):
-    """Vérifie la forme 42["auth",{...}] et renvoie True si compte démo."""
+def clean_ssid(s):
+    """Remplace les guillemets courbes (clavier iPhone) et retire les guillemets/espaces autour."""
     s = (s or "").strip()
-    if not s.startswith('42["auth"'):
+    for a, b in (("“", '"'), ("”", '"'), ("„", '"'), ("‘", "'"), ("’", "'")): s = s.replace(a, b)
+    return s.strip("'`\" \n\r\t")
+
+def parse_ssid(s):
+    """Vérifie le SSID. Renvoie True (démo), False (réel) ou None (type inconnu)."""
+    if "…" in s or "..." in s:
+        raise ValueError("Ton SSID contient « … » : c'est un aperçu coupé. Copie le message complet (clic droit, Copy message).")
+    if not s.startswith("42["):
         raise ValueError('SSID invalide : il doit commencer par 42["auth", ... Copie-le en entier.')
-    try: d = json.loads(s[2:])
-    except Exception: raise ValueError('SSID mal formé : copie le message brut en entier (clic droit, Copy message), avec tous les guillemets.')
-    if not (isinstance(d, list) and len(d) == 2 and d[0] == "auth" and isinstance(d[1], dict)):
-        raise ValueError('Format attendu : 42["auth",{...}]')
-    o = d[1]
-    if o.get("isChart"):
+    if "auth" not in s[:14]:
+        raise ValueError('Ce message n\'est pas un message "auth". Prends celui qui commence par 42["auth".')
+    if re.search(r'["\']?isChart["\']?\s*:\s*(1|true)', s):
         raise ValueError("Ce message vient du socket des graphiques (isChart). Prends celui du socket de trading.")
-    if not (o.get("session") or o.get("sessionToken")) or not o.get("uid"):
-        raise ValueError("SSID incomplet : il manque la session ou l'uid.")
-    return bool(o.get("isDemo"))
+    o = None
+    try:
+        d = json.loads(s[2:])
+        if isinstance(d, list) and len(d) == 2 and isinstance(d[1], dict): o = d[1]
+    except Exception: pass
+    if o is not None:
+        if not (o.get("session") or o.get("sessionToken")) or not o.get("uid"):
+            raise ValueError("SSID incomplet : il manque la session ou l'uid.")
+        return bool(o["isDemo"]) if "isDemo" in o else None
+    ok_sess = re.search(r'["\']?(session|sessionToken)["\']?\s*:\s*["\'][^"\']+', s)
+    ok_uid = re.search(r'["\']?uid["\']?\s*:\s*["\']?\d+', s)
+    if not (ok_sess and ok_uid):
+        raise ValueError("SSID illisible : il manque la session ou l'uid. Copie le message brut en entier, avec tous ses guillemets.")
+    m = re.search(r'["\']?isDemo["\']?\s*:\s*(1|0|true|false)', s)
+    return (m.group(1) in ("1", "true")) if m else None
 
 async def best_signal(api, cfg):
     """Scanne toutes les paires, garde le signal le plus fort (payout suffisant)."""
@@ -64,7 +80,8 @@ async def run(cfg: Cfg):
         else: await asyncio.sleep(5)
         try: S["balance"] = await asyncio.wait_for(api.balance(), 25)
         except Exception: raise RuntimeError("Connexion impossible : SSID expiré ou invalide. Récupère un SSID tout neuf.")
-        log(f"Connecté, compte {'DÉMO' if demo else 'RÉEL ⚠️'}, solde {S['balance']}")
+        mode = "DÉMO" if demo is True else "RÉEL ⚠️" if demo is False else "type inconnu, vérifie ton solde"
+        log(f"Connecté, compte {mode}, solde {S['balance']}")
         S["step"] = 0; loss_streak = 0; last_hb = 0
         while S["running"]:
             S["balance"] = await asyncio.wait_for(api.balance(), 25)
@@ -94,6 +111,7 @@ async def run(cfg: Cfg):
 async def start(cfg: Cfg, x_pw: str = Header(None)):
     auth(x_pw)
     if S["running"]: raise HTTPException(400, "Déjà en marche")
+    cfg.ssid = clean_ssid(cfg.ssid)
     try: parse_ssid(cfg.ssid)
     except ValueError as e: raise HTTPException(400, str(e))
     S.update(running=True, stats={"win": 0, "loss": 0, "draw": 0}, balance=None); S["task"] = asyncio.create_task(run(cfg)); return {"ok": True}
