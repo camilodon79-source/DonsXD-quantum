@@ -20,7 +20,7 @@ def auth(pw):
     if PASSWORD and not secrets.compare_digest(pw or "", PASSWORD): raise HTTPException(401, "Mot de passe incorrect")
 
 def clean_ssid(s):
-    """Nettoie : guillemets courbes, aperçu DevTools, et renomme sessionToken -> session (essai)."""
+    """Nettoie le SSID. Garde sessionToken ET ajoute session (même valeur)."""
     s = (s or "").strip()
     for a, b in (("“", '"'), ("”", '"'), ("„", '"'), ("‘", "'"), ("’", "'")): s = s.replace(a, b)
     s = s.strip("'`\" \n\r\t")
@@ -31,7 +31,7 @@ def clean_ssid(s):
         d = json.loads(s[2:]) if s.startswith("42[") else None
         if isinstance(d, list) and len(d) == 2 and isinstance(d[1], dict):
             o = d[1]
-            if "sessionToken" in o and "session" not in o: o["session"] = o.pop("sessionToken")
+            if "sessionToken" in o and "session" not in o: o["session"] = o["sessionToken"]
             if isinstance(o.get("uid"), str) and o["uid"].isdigit(): o["uid"] = int(o["uid"])
             o.setdefault("isDemo", 1); o.setdefault("platform", 1)
             s = "42" + json.dumps([d[0], o], separators=(",", ":"))
@@ -66,14 +66,15 @@ def parse_ssid(s):
 
 async def best_signal(api, cfg):
     """Scanne toutes les paires, garde le signal le plus fort (payout suffisant)."""
-    try: payouts = await asyncio.wait_for(api.payout(), 15)
+    pf = getattr(api, "payout", None) or getattr(api, "payouts", None)
+    try: payouts = await asyncio.wait_for(pf(), 15) if pf else {}
     except Exception: payouts = {}
     best, n = None, 0
     for a in ASSETS:
         p = payouts.get(a) if isinstance(payouts, dict) else None
         if p is not None and p < cfg.min_payout: continue
         try: candles = await asyncio.wait_for(api.get_candles(a, cfg.timeframe, cfg.timeframe * 80), 20)
-        except Exception as e: log(f"{a}: bougies indisponibles ({e})"); continue
+        except Exception as e: log(f"{a}: bougies indisponibles ({type(e).__name__}: {e})"); continue
         n += 1
         act, sc = signal(candles)
         if act and sc >= cfg.min_score and (best is None or sc > best[2]): best = (a, act, sc)
@@ -92,7 +93,10 @@ async def run(cfg: Cfg):
             except Exception: pass
         else: await asyncio.sleep(5)
         try: S["balance"] = await asyncio.wait_for(api.balance(), 25)
-        except Exception: raise RuntimeError("Connexion impossible : SSID expiré ou invalide. Récupère un SSID tout neuf.")
+        except asyncio.TimeoutError:
+            raise RuntimeError("Connexion impossible : Pocket Option n'a pas répondu en 25 s (token refusé, ou adresse du serveur bloquée).")
+        except Exception as e:
+            raise RuntimeError(f"Connexion impossible : {type(e).__name__}: {e}")
         mode = "DÉMO" if demo is True else "RÉEL ⚠️" if demo is False else "type inconnu, vérifie ton solde"
         log(f"Connecté, compte {mode}, solde {S['balance']}")
         S["step"] = 0; loss_streak = 0; last_hb = 0
@@ -106,7 +110,9 @@ async def run(cfg: Cfg):
             stake = min(cfg.amount * cfg.multiplier ** S["step"], cfg.max_stake)
             log(f"{act} {asset} {stake:.2f} (force {sc}, martingale {S['step']}/{cfg.martingales})")
             fn = api.buy if act == "CALL" else api.sell
-            _, res = await asyncio.wait_for(fn(asset=asset, amount=stake, time=cfg.timeframe, check_win=True), cfg.timeframe + 60)
+            r0 = await asyncio.wait_for(fn(asset=asset, amount=stake, time=cfg.timeframe), 30)
+            trade_id = r0[0] if isinstance(r0, (tuple, list)) else r0
+            res = await asyncio.wait_for(api.check_win(trade_id), cfg.timeframe + 60)
             r = str(res.get("result", res)).lower() if isinstance(res, dict) else str(res).lower()
             if "win" in r: S["stats"]["win"] += 1; S["step"] = 0; loss_streak = 0; log("✅ Gagné")
             elif "loss" in r or "lose" in r:
