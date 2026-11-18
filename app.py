@@ -31,7 +31,7 @@ def clean_ssid(s):
         d = json.loads(s[2:]) if s.startswith("42[") else None
         if isinstance(d, list) and len(d) == 2 and isinstance(d[1], dict):
             o = d[1]
-            if "sessionToken" in o and "session" not in o: o["session"] = o["sessionToken"]
+            if "sessionToken" in o and "session" not in o: o["session"] = o.pop("sessionToken")
             if isinstance(o.get("uid"), str) and o["uid"].isdigit(): o["uid"] = int(o["uid"])
             o.setdefault("isDemo", 1); o.setdefault("platform", 1)
             s = "42" + json.dumps([d[0], o], separators=(",", ":"))
