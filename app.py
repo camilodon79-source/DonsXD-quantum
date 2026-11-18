@@ -20,10 +20,23 @@ def auth(pw):
     if PASSWORD and not secrets.compare_digest(pw or "", PASSWORD): raise HTTPException(401, "Mot de passe incorrect")
 
 def clean_ssid(s):
-    """Remplace les guillemets courbes (clavier iPhone) et retire les guillemets/espaces autour."""
+    """Nettoie : guillemets courbes, aperçu DevTools, et renomme sessionToken -> session (essai)."""
     s = (s or "").strip()
     for a, b in (("“", '"'), ("”", '"'), ("„", '"'), ("‘", "'"), ("’", "'")): s = s.replace(a, b)
-    return s.strip("'`\" \n\r\t")
+    s = s.strip("'`\" \n\r\t")
+    s = re.sub(r",?\s*(…|\.\.\.)\s*(?=[}\]])", "", s)
+    if not re.search(r'"(session|sessionToken|uid)"\s*:', s):
+        s = re.sub(r'([{,]\s*)([A-Za-z_]\w*)(\s*:)', r'\1"\2"\3', s)
+    try:
+        d = json.loads(s[2:]) if s.startswith("42[") else None
+        if isinstance(d, list) and len(d) == 2 and isinstance(d[1], dict):
+            o = d[1]
+            if "sessionToken" in o and "session" not in o: o["session"] = o.pop("sessionToken")
+            if isinstance(o.get("uid"), str) and o["uid"].isdigit(): o["uid"] = int(o["uid"])
+            o.setdefault("isDemo", 1); o.setdefault("platform", 1)
+            s = "42" + json.dumps([d[0], o], separators=(",", ":"))
+    except Exception: pass
+    return s
 
 def parse_ssid(s):
     """Vérifie le SSID. Renvoie True (démo), False (réel) ou None (type inconnu)."""
