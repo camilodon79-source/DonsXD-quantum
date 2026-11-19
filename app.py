@@ -1,4 +1,5 @@
 import asyncio, os, time, secrets, json, re
+import urllib.request, urllib.error
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
@@ -20,7 +21,7 @@ def auth(pw):
     if PASSWORD and not secrets.compare_digest(pw or "", PASSWORD): raise HTTPException(401, "Mot de passe incorrect")
 
 def clean_ssid(s):
-    """Nettoie le SSID. Garde sessionToken ET ajoute session (même valeur)."""
+    """Nettoie le SSID et renomme sessionToken en session (même valeur)."""
     s = (s or "").strip()
     for a, b in (("“", '"'), ("”", '"'), ("„", '"'), ("‘", "'"), ("’", "'")): s = s.replace(a, b)
     s = s.strip("'`\" \n\r\t")
@@ -84,6 +85,10 @@ async def run(cfg: Cfg):
     try:
         try: from BinaryOptionsToolsV2.pocketoption import PocketOptionAsync
         except ImportError: from BinaryOptionsToolsV2 import PocketOptionAsync
+        try:
+            from BinaryOptionsToolsV2.tracing import start_logs
+            start_logs(path="/tmp/po_logs", level="INFO", terminal=True)
+        except Exception: pass
         demo = parse_ssid(cfg.ssid)
         log("Connexion à Pocket Option…")
         api = PocketOptionAsync(cfg.ssid)
@@ -125,6 +130,23 @@ async def run(cfg: Cfg):
     except Exception as e: log(f"Erreur : {e}")
     finally:
         S["running"] = False; log("Bot arrêté")
+
+def _probe(url):
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return f"{r.status} {r.read(60).decode('utf-8', 'ignore')!r}"
+    except urllib.error.HTTPError as e: return f"HTTP {e.code} (serveur: {e.headers.get('server', '?')})"
+    except Exception as e: return f"{type(e).__name__}: {e}"
+
+@app.get("/api/diag")
+async def diag():
+    urls = ["https://pocketoption.com/en/",
+            "https://api-eu.po.market/socket.io/?EIO=4&transport=polling",
+            "https://api-sc.po.market/socket.io/?EIO=4&transport=polling",
+            "https://demo-api-eu.po.market/socket.io/?EIO=4&transport=polling"]
+    res = await asyncio.gather(*[asyncio.to_thread(_probe, u) for u in urls])
+    return dict(zip(urls, res))
 
 @app.post("/api/start")
 async def start(cfg: Cfg, x_pw: str = Header(None)):
