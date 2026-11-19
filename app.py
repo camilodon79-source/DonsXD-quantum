@@ -7,11 +7,12 @@ from strategy import signal
 
 PASSWORD = os.environ.get("APP_PASSWORD", "")
 ASSETS = os.environ.get("ASSETS", "EURUSD_otc,GBPUSD_otc,USDJPY_otc,AUDUSD_otc,EURJPY_otc,AUDCAD_otc,EURGBP_otc").split(",")
+WS_URL = "wss://demo-api-eu.po.market/socket.io/?EIO=4&transport=websocket"
 app = FastAPI()
 S = {"running": False, "log": [], "stats": {"win": 0, "loss": 0, "draw": 0}, "balance": None, "step": 0, "task": None}
 
 class Cfg(BaseModel):
-    ssid: str; timeframe: int = 60; amount: float = 1; martingales: int = 2; multiplier: float = 2.2
+    ssid: str; raw: str = ""; timeframe: int = 60; amount: float = 1; martingales: int = 2; multiplier: float = 2.2
     max_stake: float = 50; max_losses: int = 5; min_score: int = 2; min_payout: int = 80
 
 def log(m):
@@ -20,14 +21,15 @@ def log(m):
 def auth(pw):
     if PASSWORD and not secrets.compare_digest(pw or "", PASSWORD): raise HTTPException(401, "Mot de passe incorrect")
 
-def clean_ssid(s):
-    """Nettoie le SSID et renomme sessionToken en session (même valeur)."""
+def clean_ssid(s, rename=True):
+    """Nettoie le SSID. rename=True : sessionToken devient session (pour la librairie)."""
     s = (s or "").strip()
     for a, b in (("“", '"'), ("”", '"'), ("„", '"'), ("‘", "'"), ("’", "'")): s = s.replace(a, b)
     s = s.strip("'`\" \n\r\t")
     s = re.sub(r",?\s*(…|\.\.\.)\s*(?=[}\]])", "", s)
     if not re.search(r'"(session|sessionToken|uid)"\s*:', s):
         s = re.sub(r'([{,]\s*)([A-Za-z_]\w*)(\s*:)', r'\1"\2"\3', s)
+    if not rename: return s
     try:
         d = json.loads(s[2:]) if s.startswith("42[") else None
         if isinstance(d, list) and len(d) == 2 and isinstance(d[1], dict):
@@ -65,6 +67,42 @@ def parse_ssid(s):
     m = re.search(r'["\']?isDemo["\']?\s*:\s*(1|0|true|false)', s)
     return (m.group(1) in ("1", "true")) if m else None
 
+async def ws_auth_test(msg):
+    """Envoie directement le message d'auth à Pocket Option (sans la librairie) et donne le verdict."""
+    ws = None
+    try:
+        import websockets
+        hdr = {"User-Agent": "Mozilla/5.0"}
+        for kw in ("additional_headers", "extra_headers"):
+            try:
+                ws = await websockets.connect(WS_URL, origin="https://pocketoption.com", open_timeout=15, **{kw: hdr}); break
+            except TypeError: continue
+        if ws is None: return "test impossible (librairie websockets incompatible)"
+        async def recv(t):
+            m = await asyncio.wait_for(ws.recv(), t)
+            return m.decode("utf-8", "ignore") if isinstance(m, bytes) else m
+        await recv(8)
+        await ws.send("40")
+        end = time.time() + 6
+        while time.time() < end:
+            m = await recv(5)
+            if m.startswith("40"): break
+            if m == "2": await ws.send("3")
+        await ws.send(msg)
+        end = time.time() + 12
+        while time.time() < end:
+            m = await recv(8)
+            if m == "2": await ws.send("3"); continue
+            if m.startswith("41") or "NotAuthorized" in m: return "REFUSÉ par Pocket Option"
+            if "successauth" in m: return "ACCEPTÉ ✅"
+        return "pas de réponse claire"
+    except asyncio.TimeoutError: return "pas de réponse (délai dépassé)"
+    except Exception as e: return f"test impossible ({type(e).__name__}: {e})"
+    finally:
+        if ws is not None:
+            try: await ws.close()
+            except Exception: pass
+
 async def best_signal(api, cfg):
     """Scanne toutes les paires, garde le signal le plus fort (payout suffisant)."""
     pf = getattr(api, "payout", None) or getattr(api, "payouts", None)
@@ -90,6 +128,9 @@ async def run(cfg: Cfg):
             start_logs(path="/tmp/po_logs", level="INFO", terminal=True)
         except Exception: pass
         demo = parse_ssid(cfg.ssid)
+        log("Test direct de connexion (sans la librairie)…")
+        if cfg.raw: log(f"Message d'origine : {await ws_auth_test(cfg.raw)}")
+        log(f"Message renommé (celui de la librairie) : {await ws_auth_test(cfg.ssid)}")
         log("Connexion à Pocket Option…")
         api = PocketOptionAsync(cfg.ssid)
         wa = getattr(api, "wait_for_assets", None)
@@ -99,7 +140,7 @@ async def run(cfg: Cfg):
         else: await asyncio.sleep(5)
         try: S["balance"] = await asyncio.wait_for(api.balance(), 25)
         except asyncio.TimeoutError:
-            raise RuntimeError("Connexion impossible : Pocket Option n'a pas répondu en 25 s (token refusé, ou adresse du serveur bloquée).")
+            raise RuntimeError("Connexion impossible : Pocket Option n'a pas répondu en 25 s (session refusée).")
         except Exception as e:
             raise RuntimeError(f"Connexion impossible : {type(e).__name__}: {e}")
         mode = "DÉMO" if demo is True else "RÉEL ⚠️" if demo is False else "type inconnu, vérifie ton solde"
@@ -152,6 +193,7 @@ async def diag():
 async def start(cfg: Cfg, x_pw: str = Header(None)):
     auth(x_pw)
     if S["running"]: raise HTTPException(400, "Déjà en marche")
+    cfg.raw = clean_ssid(cfg.ssid, rename=False)
     cfg.ssid = clean_ssid(cfg.ssid)
     try: parse_ssid(cfg.ssid)
     except ValueError as e: raise HTTPException(400, str(e))
