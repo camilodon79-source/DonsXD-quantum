@@ -1,10 +1,9 @@
 import asyncio, os, time, secrets, json, re
 import urllib.request, urllib.error
-import numpy as np
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
-from strategy import signal, haar_denoise, ema, rsi
+from strategy import signal
 
 # Un ou plusieurs mots de passe séparés par des virgules. Chaque mot de passe a son propre espace.
 PASSWORDS = [p.strip() for p in os.environ.get("APP_PASSWORD", "").split(",") if p.strip()]
@@ -23,7 +22,9 @@ def auth(pw):
 
 class Cfg(BaseModel):
     ssid: str; timeframe: int = 60; amount: float = 1; martingales: int = 2; multiplier: float = 2.2
-    max_stake: float = 50; max_losses: int = 5; min_score: int = 2; min_payout: int = 80
+    max_stake: float = 50; max_losses: int = 5; min_score: int = 2; min_payout: int = 85
+    max_loss: float = float(os.environ.get("MAX_LOSS", "0"))        # perte max de la session (0 = désactivé)
+    max_minutes: int = int(os.environ.get("MAX_MINUTES", "0"))      # durée max en minutes (0 = désactivé)
 
 def log(st, m):
     st["log"].append(f"{time.strftime('%H:%M:%S')}  {m}"); del st["log"][:-80]
@@ -73,34 +74,6 @@ def parse_ssid(s):
     m = re.search(r'["\']?isDemo["\']?\s*:\s*(1|0|true|false)', s)
     return (m.group(1) in ("1", "true")) if m else None
 
-def signal_aggr(candles):
-    """QuantumFlux variante agressive : seuils plus bas, plus de trades. Retourne (action, score)."""
-    if len(candles) < 40: return None, 0
-    o, h, l, c = (haar_denoise([k[f] for k in candles], 3) for f in ("open", "high", "low", "close"))
-    f, s = ema(c, 5), ema(c, 13)
-    sma, sd = c[-20:].mean(), c[-20:].std()
-    r = rsi(c); r0, r1 = r[-2], r[-1]
-    def stoch_at(i):
-        lo, hi = l[max(0, i - 13):i + 1].min(), h[max(0, i - 13):i + 1].max()
-        return (c[i] - lo) / max(hi - lo, 1e-12) * 100
-    ks = [stoch_at(i) for i in range(len(c) - 5, len(c))]
-    st0, st1 = np.mean(ks[-4:-1]), np.mean(ks[-3:])
-    up, dn = f[-1] > s[-1], f[-1] < s[-1]
-    cl = c[-1]; bull, bear = cl > o[-1], cl < o[-1]
-    xlo, xhi = cl < sma - sd * 1.5, cl > sma + sd * 1.5
-    olo, ohi = cl < sma - sd * 0.8, cl > sma + sd * 0.8
-    co = lambda a, b, lv: a <= lv < b; cu = lambda a, b, lv: a >= lv > b
-    rules = [
-        (xlo and r1 < 35 and st1 < 25 and bull, "CALL", 3), (xhi and r1 > 65 and st1 > 75 and bear, "PUT", 3),
-        (up and co(r0, r1, 30) and bull, "CALL", 3), (dn and cu(r0, r1, 70) and bear, "PUT", 3),
-        (olo and r1 < 35 and bull, "CALL", 2), (ohi and r1 > 65 and bear, "PUT", 2),
-        (olo and up, "CALL", 2), (ohi and dn, "PUT", 2),
-        (up and co(st0, st1, 20), "CALL", 2), (dn and cu(st0, st1, 80), "PUT", 2),
-    ]
-    for cond, act, sc in rules:
-        if cond: return act, sc
-    return None, 0
-
 def pick_assets(payouts, cfg):
     """Prend les paires de devises les mieux payées (jusqu'à MAX_ASSETS), sinon la liste par défaut."""
     if isinstance(payouts, dict) and payouts:
@@ -110,27 +83,36 @@ def pick_assets(payouts, cfg):
         if c: return [a for a, _ in c[:MAX_ASSETS]]
     return ASSETS
 
-async def scan_one(api, a, cfg, sem, fn):
+async def scan_one(api, a, cfg, sem, fn, errs):
+    off = cfg.timeframe * 50
     async with sem:
-        try: candles = await asyncio.wait_for(api.get_candles(a, cfg.timeframe, cfg.timeframe * 80), 15)
-        except Exception: return a, None, 0, False
+        try: candles = await asyncio.wait_for(api.get_candles(a, cfg.timeframe, off), 12 + off / 250)
+        except Exception as e:
+            errs.append(type(e).__name__); return a, None, 0, False
     act, sc = fn(candles)
     return a, act, sc, True
 
 async def best_signal(api, cfg):
-    """Analyse toutes les paires en parallèle et garde le signal le plus fort."""
+    """Analyse les paires et garde le signal le plus fort. Moins de paires et moins en parallèle sur les longs timeframes."""
     pf = getattr(api, "payout", None) or getattr(api, "payouts", None)
     try: payouts = await asyncio.wait_for(pf(), 15) if pf else {}
     except Exception: payouts = {}
-    fn = signal_aggr if cfg.min_score <= 2 else signal
-    sem = asyncio.Semaphore(8)
-    res = await asyncio.gather(*[scan_one(api, a, cfg, sem, fn) for a in pick_assets(payouts, cfg)])
+    fn = signal
+    tf = cfg.timeframe
+    limit = MAX_ASSETS if tf <= 15 else min(MAX_ASSETS, 8) if tf <= 60 else min(MAX_ASSETS, 5)
+    sem = asyncio.Semaphore(8 if tf <= 5 else 4 if tf <= 30 else 1)
+    errs = []
+    res = await asyncio.gather(*[scan_one(api, a, cfg, sem, fn, errs) for a in pick_assets(payouts, cfg)[:limit]])
     best, n = None, 0
     for a, act, sc, ok in res:
         if not ok: continue
         n += 1
         if act and sc >= cfg.min_score and (best is None or sc > best[2]): best = (a, act, sc)
-    return best, n
+    return best, n, errs
+
+def rate(st):
+    w, l = st["stats"]["win"], st["stats"]["loss"]
+    return f"{w}/{w + l} = {round(100 * w / (w + l))}%" if w + l else "0/0"
 
 def trade_result(res):
     """Renvoie 'win', 'loss' ou 'draw' à partir de la réponse de la librairie."""
@@ -171,13 +153,19 @@ async def run(cfg: Cfg, st):
         mode = "DÉMO" if demo is True else "RÉEL ⚠️" if demo is False else "type inconnu, vérifie ton solde"
         log(st, f"Connecté, compte {mode}, solde {st['balance']}")
         st["step"] = 0; loss_streak = 0; last_hb = 0; last_bal = time.time()
+        start_bal = float(st["balance"]) if st["balance"] is not None else None; t0 = time.time()
+        if cfg.max_loss: log(st, f"Protection : arrêt si la perte dépasse {cfg.max_loss}")
+        if cfg.max_minutes: log(st, f"Protection : arrêt après {cfg.max_minutes} min")
         while st["running"]:
+            if cfg.max_minutes and time.time() - t0 > cfg.max_minutes * 60:
+                log(st, f"Arrêt : durée maximale atteinte ({cfg.max_minutes} min)"); break
             if time.time() - last_bal > 20:
                 st["balance"] = await asyncio.wait_for(api.balance(), 25); last_bal = time.time()
-            sig, n = await best_signal(api, cfg)
+            sig, n, errs = await best_signal(api, cfg)
             if not sig:
-                if time.time() - last_hb > 60: log(st, f"Aucun signal pour l'instant ({n} paires analysées)"); last_hb = time.time()
-                await asyncio.sleep(1); continue
+                if time.time() - last_hb > 60:
+                    log(st, f"Aucun signal pour l'instant ({n} paires analysées)" + (f" — erreurs : {errs[0]} x{len(errs)}" if errs else "")); last_hb = time.time()
+                await asyncio.sleep(1 if n else 5); continue
             asset, act, sc = sig
             stake = round(min(cfg.amount * cfg.multiplier ** st["step"], cfg.max_stake), 2)
             log(st, f"{act} {asset} {stake:.2f} (force {sc}, martingale {st['step']}/{cfg.martingales})")
@@ -192,8 +180,12 @@ async def run(cfg: Cfg, st):
                 st["step"] = st["step"] + 1 if st["step"] < cfg.martingales else 0
                 if loss_streak >= cfg.max_losses: log(st, "Arrêt : trop de pertes d'affilée"); st["running"] = False
             else: st["stats"]["draw"] += 1; log(st, f"↔ Égalité ({str(res)[:80]})")
-            last_bal = 0
-            await asyncio.sleep(1)
+            log(st, f"Bilan : {rate(st)} de réussite")
+            try: st["balance"] = await asyncio.wait_for(api.balance(), 15); last_bal = time.time()
+            except Exception: last_bal = 0
+            if cfg.max_loss and start_bal is not None and st["balance"] is not None and start_bal - float(st["balance"]) >= cfg.max_loss:
+                log(st, f"Arrêt : perte maximale atteinte (-{start_bal - float(st['balance']):.2f})"); break
+            await asyncio.sleep(min(cfg.timeframe, 60))  # pause d'une bougie : pas de trades en rafale
     except asyncio.CancelledError: pass
     except asyncio.TimeoutError: log(st, "Connexion perdue avec Pocket Option (session coupée). Reprends un SSID tout neuf.")
     except Exception as e: log(st, f"Erreur : {e}")
