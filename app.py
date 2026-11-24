@@ -150,8 +150,8 @@ def eligible(payouts, cfg, mem):
 async def get_closed(api, a, cfg, mem, errs):
     """Bougies terminées d'une paire (50 max). Utilise la mémoire si les bougies sont horodatées."""
     tf = cfg.timeframe; d = mem.store.get(a); inc = bool(mem.ok and d)
-    off = tf * 4 if inc else tf * 53
-    try: raw = await asyncio.wait_for(api.get_candles(a, tf, off), 12 + off / 250)
+    off = 4 if inc else 53
+    try: raw = await asyncio.wait_for(api.get_candles(a, tf, off), 12 + off * tf / 250)
     except Exception as e:
         errs.append(type(e).__name__)
         n = mem.fail[a] = mem.fail.get(a, 0) + 1
@@ -427,3 +427,5 @@ async def index():
     with open("static/index.html", encoding="utf-8") as f: html = f.read()
     html = html.replace('<button data-v="5">5s</button>', '<button data-v="5">5s</button><button data-v="10">10s</button>')
     return HTMLResponse(html.replace("</body>", SOUND_JS + "</body>"))
+
+# FIN DU FICHIER
